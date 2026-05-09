@@ -1,3 +1,4 @@
+# Python
 __pycache__/
 *.pyc
 *.pyo
@@ -6,8 +7,47 @@ dist/
 build/
 *.so
 .eggs/
-demo_render/
+
+# Output directories (training/eval results - too large for git)
+output_*/
+
+# Large files
+*.onnx
+*.pdf
+*.log
+
+# Example data (large scenes - download separately)
+example/courthouse/
+example/courthouse_sky_masks/
+example/university/
+example/oxford/
+example/loop/
+
+# Keep courthouse_small for quick testing
+!example/courthouse_small/
+
+# IDE / OS
+.DS_Store
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# Claude / AI assistant
 CLAUDE.md
 .claude/
 .agents/
-skyseg.onnx
+
+# Upstream demo_render (not our code)
+demo_render/
+
+# Figures (regeneratable)
+figures/
+
+# Model checkpoints (download separately or regenerate)
+checkpoints/
+*.pt
+
+# Keep best checkpoint directory structure but not weights
+!paper/
