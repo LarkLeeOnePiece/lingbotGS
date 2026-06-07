@@ -35,7 +35,6 @@ example/loop/
 .vscode/
 
 # Claude / AI assistant
-CLAUDE.md
 .claude/
 .agents/
 

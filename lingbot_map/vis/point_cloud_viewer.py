@@ -32,6 +32,255 @@ from lingbot_map.utils.geometry import closed_form_inverse_se3, unproject_depth_
 from lingbot_map.vis.utils import CameraState
 from lingbot_map.vis.sky_segmentation import apply_sky_segmentation
 
+try:
+    import moderngl
+    _HAS_MODERNGL = True
+except ImportError:
+    _HAS_MODERNGL = False
+
+
+class _GLPointRenderer:
+    """OpenGL offscreen point cloud renderer using moderngl.
+
+    Uses hardware rasterization + z-test for ~200x speedup over PyTorch z-buffer.
+    Renders color + point index in a single pass via MRT (Multiple Render Targets).
+    """
+
+    _VERT = """
+    #version 330
+    in vec3 in_pos;
+    in vec3 in_color;
+    in float in_id;
+    uniform mat4 mvp;
+    uniform float point_size;
+    out vec3 v_color;
+    flat out float v_id;
+    void main() {
+        gl_Position = mvp * vec4(in_pos, 1.0);
+        gl_PointSize = point_size;
+        v_color = in_color;
+        v_id = in_id;
+    }
+    """
+
+    _FRAG = """
+    #version 330
+    in vec3 v_color;
+    flat in float v_id;
+    layout(location=0) out vec4 frag_color;
+    layout(location=1) out vec4 frag_id;
+    void main() {
+        frag_color = vec4(v_color, 1.0);
+        frag_id = vec4(v_id, 0.0, 0.0, 1.0);
+    }
+    """
+
+    def __init__(self):
+        self.ctx = moderngl.create_standalone_context()
+        self.prog = self.ctx.program(
+            vertex_shader=self._VERT, fragment_shader=self._FRAG
+        )
+        self.ctx.enable(moderngl.DEPTH_TEST)
+        self.ctx.enable(moderngl.PROGRAM_POINT_SIZE)
+        self._fbo = None
+        self._fbo_size = None
+        self._vbo = None
+        self._vao = None
+        self._vbo_pos = None
+        self._vbo_col = None
+        self._vbo_id = None
+
+    def _ensure_fbo(self, W, H):
+        if self._fbo_size == (W, H):
+            return
+        if self._fbo is not None:
+            self._fbo.release()
+            self._fbo_color.release()
+            self._fbo_id.release()
+            self._fbo_depth.release()
+        self._fbo_color = self.ctx.texture((W, H), 4, dtype='f4')
+        self._fbo_id = self.ctx.texture((W, H), 4, dtype='f4')
+        self._fbo_depth = self.ctx.depth_renderbuffer((W, H))
+        self._fbo = self.ctx.framebuffer(
+            color_attachments=[self._fbo_color, self._fbo_id],
+            depth_attachment=self._fbo_depth,
+        )
+        self._fbo_size = (W, H)
+
+    def upload_points(self, pts, cols, point_indices):
+        """Upload point cloud using separate VBOs (no interleaving needed).
+
+        Args:
+            pts: (N, 3) float32 numpy — contiguous
+            cols: (N, 3) float32 numpy — contiguous
+            point_indices: (N,) int64 numpy — global point IDs
+        """
+        N = len(pts)
+        self._full_N = N
+        if N == 0:
+            return
+
+        pts_f32 = np.ascontiguousarray(pts, dtype=np.float32)
+        cols_f32 = np.ascontiguousarray(cols, dtype=np.float32)
+        ids_f32 = np.ascontiguousarray(point_indices.astype(np.float32))
+
+        pos_bytes = pts_f32.nbytes
+        col_bytes = cols_f32.nbytes
+        id_bytes = ids_f32.nbytes
+
+        def _ensure_buf(old_buf, size, data):
+            if old_buf is not None and old_buf.size >= size:
+                old_buf.write(data)
+                return old_buf
+            if old_buf is not None:
+                old_buf.release()
+            buf = self.ctx.buffer(reserve=int(size * 1.2))
+            buf.write(data)
+            return buf
+
+        self._vbo_pos = _ensure_buf(self._vbo_pos, pos_bytes, pts_f32)
+        self._vbo_col = _ensure_buf(self._vbo_col, col_bytes, cols_f32)
+        self._vbo_id = _ensure_buf(self._vbo_id, id_bytes, ids_f32)
+
+        # Recreate VAO (lightweight, just binds existing buffers)
+        if self._vao is not None:
+            self._vao.release()
+        self._vao = self.ctx.vertex_array(
+            self.prog,
+            [
+                (self._vbo_pos, '3f', 'in_pos'),
+                (self._vbo_col, '3f', 'in_color'),
+                (self._vbo_id, '1f', 'in_id'),
+            ],
+        )
+
+    def kill_points(self, indices):
+        """Move points behind camera (z=-1e6) so OpenGL clips them.
+
+        Uses batched writes for contiguous runs, falls back to individual
+        writes for scattered indices. Typically ~0.1ms for 1000 points.
+        """
+        if self._vbo_pos is None or len(indices) == 0:
+            return
+        indices = np.asarray(indices, dtype=np.int64)
+        indices.sort()
+        dead_pos = np.array([0.0, 0.0, -1e6], dtype=np.float32)
+
+        # Find contiguous runs for batched writes
+        if len(indices) == 0:
+            return
+        breaks = np.where(np.diff(indices) != 1)[0] + 1
+        runs = np.split(indices, breaks)
+
+        for run in runs:
+            start = int(run[0])
+            count = len(run)
+            dead_block = np.tile(dead_pos, count).astype(np.float32)
+            self._vbo_pos.write(dead_block.tobytes(), offset=start * 12)
+
+    def render_view(self, R_w2c, t_w2c, K, H, W, point_size=1.0,
+                    num_points=None, first=0):
+        """Render from a viewpoint using pre-uploaded points.
+
+        Args:
+            num_points: Render N points starting from `first`.
+                        If None, render all uploaded points.
+            first: Index of first point to render (default 0).
+        """
+        N = num_points if num_points is not None else self._full_N
+        vertices = N - first
+        if vertices <= 0:
+            return (np.zeros((H, W, 3), dtype=np.float32),
+                    np.zeros((H, W), dtype=bool),
+                    np.full((H, W), -1, dtype=np.int64))
+
+        self._ensure_fbo(W, H)
+        mvp = self._build_mvp(R_w2c, t_w2c, K, H, W)
+
+        self.prog['mvp'].write(mvp.T.tobytes())
+        self.prog['point_size'].value = point_size
+
+        self._fbo.use()
+        self._fbo.clear(0.0, 0.0, 0.0, 0.0)
+        self._vao.render(moderngl.POINTS, vertices=vertices, first=first)
+
+        return self._read_fbo(H, W)
+
+    def render(self, pts, cols, point_indices, R_w2c, t_w2c, K, H, W, point_size=1.0):
+        """One-shot render: upload + render. Use upload_points + render_view for batches."""
+        N = len(pts)
+        if N == 0:
+            return (np.zeros((H, W, 3), dtype=np.float32),
+                    np.zeros((H, W), dtype=bool),
+                    np.full((H, W), -1, dtype=np.int64))
+
+        self.upload_points(pts, cols, point_indices)
+        return self.render_view(R_w2c, t_w2c, K, H, W, point_size=point_size)
+
+    @staticmethod
+    def _build_mvp(R_w2c, t_w2c, K, H, W):
+        fx, fy = float(K[0, 0]), float(K[1, 1])
+        cx, cy = float(K[0, 2]), float(K[1, 2])
+        near, far = 0.01, 1000.0
+
+        proj = np.zeros((4, 4), dtype=np.float32)
+        proj[0, 0] = 2 * fx / W
+        proj[1, 1] = 2 * fy / H
+        proj[0, 2] = 1.0 - 2 * cx / W
+        proj[1, 2] = 2 * cy / H - 1.0
+        proj[2, 2] = -(far + near) / (far - near)
+        proj[2, 3] = -2 * far * near / (far - near)
+        proj[3, 2] = -1.0
+
+        view = np.eye(4, dtype=np.float32)
+        view[:3, :3] = R_w2c.astype(np.float32)
+        view[:3, 3] = t_w2c.astype(np.float32)
+        flip = np.diag([1.0, -1.0, -1.0, 1.0]).astype(np.float32)
+        view = flip @ view
+
+        return (proj @ view).astype(np.float32)
+
+    def _read_fbo(self, H, W):
+        raw_color = self._fbo_color.read()
+        raw_id = self._fbo_id.read()
+
+        # Color is now f4 (float32) — no quantization
+        color_img = np.frombuffer(raw_color, dtype=np.float32).reshape(H, W, 4)
+        color_img = color_img[::-1].copy()
+        rendered = color_img[:, :, :3]
+        coverage = color_img[:, :, 3] > 0
+
+        id_img = np.frombuffer(raw_id, dtype=np.float32).reshape(H, W, 4)
+        id_img = id_img[::-1].copy()
+        index_buf = np.round(id_img[:, :, 0]).astype(np.int64)
+        index_buf[~coverage] = -1
+
+        return (rendered, coverage, index_buf)
+
+    def release(self):
+        if self._vao is not None:
+            self._vao.release()
+        for buf in (self._vbo, self._vbo_pos, self._vbo_col, self._vbo_id):
+            if buf is not None:
+                buf.release()
+        if self._fbo is not None:
+            self._fbo.release()
+            self._fbo_color.release()
+            self._fbo_id.release()
+            self._fbo_depth.release()
+        self.ctx.release()
+
+
+# Thread-local GL renderer (each thread gets its own OpenGL context)
+import threading as _threading
+_gl_thread_local = _threading.local()
+
+
+def _get_gl_renderer():
+    if not hasattr(_gl_thread_local, 'renderer'):
+        _gl_thread_local.renderer = _GLPointRenderer()
+    return _gl_thread_local.renderer
+
 
 class PointCloudViewer:
     """
@@ -529,6 +778,86 @@ class PointCloudViewer:
                 save_original_video=self.save_original_video_checkbox.value
             )
 
+        # ── Rendering Comparison panel ────────────────────────────────────
+        with self.server.gui.add_folder("Rendering Comparison"):
+            self.render_mode_dropdown = self.server.gui.add_dropdown(
+                "Mode", options=["All Frames", "Accumulated"],
+                initial_value="All Frames",
+                hint="All Frames: full point cloud. Accumulated: only frames 0..i.",
+            )
+            self.render_stride_slider = self.server.gui.add_slider(
+                "Point Stride", min=1, max=8, step=1, initial_value=3,
+                hint="Spatial downsample stride (higher = faster, sparser)",
+            )
+            self.compute_render_btn = self.server.gui.add_button(
+                "Compute Renderings",
+                hint="Pre-compute z-buffer renderings from each viewpoint",
+            )
+            self.render_status_text = self.server.gui.add_text(
+                "Status", initial_value="Click 'Compute Renderings' to start"
+            )
+            self.render_metrics_text = self.server.gui.add_text("Metrics", initial_value="—")
+            placeholder = np.zeros((10, 30, 3), dtype=np.uint8)
+            self.render_comparison_image = self.server.gui.add_image(
+                placeholder, label="GT | Rendered | Error"
+            )
+
+        @self.compute_render_btn.on_click
+        def _(_) -> None:
+            self.compute_render_btn.disabled = True
+            accumulated = self.render_mode_dropdown.value == "Accumulated"
+            stride = int(self.render_stride_slider.value)
+            threading.Thread(
+                target=self._precompute_renderings,
+                args=(stride, accumulated),
+                daemon=True,
+            ).start()
+
+        # ── Error-based point filtering ───────────────────────────────
+        with self.server.gui.add_folder("Error-Based Filtering"):
+            self.error_threshold_slider = self.server.gui.add_slider(
+                "Error Threshold", min=0.01, max=0.5, step=0.01, initial_value=0.1,
+                hint="Mean RGB error above this marks a pixel as 'bad'",
+            )
+            self.min_bad_views_slider = self.server.gui.add_slider(
+                "Min Bad Views", min=1, max=20, step=1, initial_value=2,
+                hint="A point must be bad in >= this many views to be removed",
+            )
+            self.compute_filter_btn = self.server.gui.add_button(
+                "Compute Filtered Renderings",
+                hint="Identify bad points via error map and re-render without them",
+            )
+            self.filter_status_text = self.server.gui.add_text(
+                "Filter Status", initial_value="Run 'Compute Renderings' first"
+            )
+            self.show_filtered_checkbox = self.server.gui.add_checkbox(
+                "Show Filtered", initial_value=False,
+                hint="Toggle between original and filtered renderings",
+            )
+            self.filter_comparison_image = self.server.gui.add_image(
+                np.zeros((10, 30, 3), dtype=np.uint8),
+                label="Original | Filtered | Improvement",
+            )
+
+        @self.compute_filter_btn.on_click
+        def _(_) -> None:
+            if not hasattr(self, '_pts_per_frame'):
+                self.filter_status_text.value = "Run 'Compute Renderings' first!"
+                return
+            self.compute_filter_btn.disabled = True
+            error_thresh = self.error_threshold_slider.value
+            min_views = int(self.min_bad_views_slider.value)
+            threading.Thread(
+                target=self._compute_error_filter,
+                args=(error_thresh, min_views),
+                daemon=True,
+            ).start()
+
+        @self.show_filtered_checkbox.on_update
+        def _(_) -> None:
+            if hasattr(self, 'gui_timestep'):
+                self._update_render_display(self.gui_timestep.value)
+
         @self.show_video_checkbox.on_update
         def _(_) -> None:
             if self.current_frame_image is not None:
@@ -861,6 +1190,518 @@ class PointCloudViewer:
             frame_node.visible = (
                 i <= current_timestep if not self.fourd else i == current_timestep
             )
+
+    # ── Rendering Comparison methods ────────────────────────────────────────
+
+    def _precompute_renderings(self, stride=3, accumulated=False):
+        """Pre-compute z-buffer renderings from each camera viewpoint."""
+        if not hasattr(self, 'original_images') or len(self.original_images) == 0:
+            self.render_status_text.value = "No images available"
+            self.compute_render_btn.disabled = False
+            return
+
+        H, W = self.original_images[0].shape[:2]
+        S = len(self.all_steps)
+
+        # Collect points per frame
+        self.render_status_text.value = "Collecting points..."
+        pts_per_frame = []
+        cols_per_frame = []
+
+        for step in self.all_steps:
+            pc = self.pcs[step]["pc"]
+            color = self.pcs[step]["color"]
+            conf = self.pcs[step]["conf"]
+
+            if pc.size == 0:
+                pts_per_frame.append(np.zeros((0, 3), dtype=np.float32))
+                cols_per_frame.append(np.zeros((0, 3), dtype=np.float32))
+                continue
+
+            pc_ds = pc[::stride, ::stride]
+            color_ds = color[::stride, ::stride]
+            conf_ds = conf[::stride, ::stride]
+
+            pts = pc_ds.reshape(-1, 3)
+            cols = color_ds.reshape(-1, 3)
+            conf_flat = conf_ds.reshape(-1)
+
+            valid = (conf_flat > self.vis_threshold) & np.isfinite(pts).all(axis=1)
+            pts_per_frame.append(pts[valid].astype(np.float32))
+            cols_per_frame.append(cols[valid].astype(np.float32))
+
+        # Save for error-based filtering
+        self._pts_per_frame = pts_per_frame
+        self._cols_per_frame = cols_per_frame
+        self._render_stride = stride
+
+        total_pts = sum(len(p) for p in pts_per_frame)
+        self.render_status_text.value = f"{total_pts:,} pts. Rendering {S} frames..."
+
+        # Pre-upload full point cloud once for OpenGL rendering
+        all_pts_cat = np.concatenate(
+            [p for p in pts_per_frame if len(p) > 0] or [np.zeros((0, 3), dtype=np.float32)],
+            axis=0,
+        )
+        all_cols_cat = np.concatenate(
+            [c for c in cols_per_frame if len(c) > 0] or [np.zeros((0, 3), dtype=np.float32)],
+            axis=0,
+        )
+        all_idx_cat = np.arange(len(all_pts_cat), dtype=np.int64)
+
+        # Frame boundary offsets for accumulated mode
+        offsets = [0]
+        for p in pts_per_frame:
+            offsets.append(offsets[-1] + len(p))
+
+        splat_radius = stride // 2 if stride > 1 else 0
+        point_size = max(1.0, float(2 * splat_radius + 1))
+
+        gl = _get_gl_renderer()
+        gl.upload_points(all_pts_cat, all_cols_cat, all_idx_cat)
+
+        self._rendered_frames = []
+
+        for i, step in enumerate(self.all_steps):
+            R_c2w = np.asarray(self.cam_dict["R"][step], dtype=np.float64)
+            t_c2w = np.asarray(self.cam_dict["t"][step], dtype=np.float64)
+            R_w2c = R_c2w.T
+            t_w2c = -R_w2c @ t_c2w
+
+            focal = float(self.cam_dict["focal"][step])
+            ppx, ppy = self.cam_dict["pp"][step]
+            K = np.array([[focal, 0, float(ppx)],
+                          [0, focal, float(ppy)],
+                          [0, 0, 1]], dtype=np.float64)
+
+            # Render: accumulated uses first offsets[i+1] points, all-frames uses all
+            num_pts = offsets[i + 1] if accumulated else len(all_pts_cat)
+            rendered, coverage, _ = gl.render_view(
+                R_w2c, t_w2c, K, H, W, point_size=point_size,
+                num_points=num_pts,
+            )
+
+            # GT as float [0, 1]
+            gt_float = self.original_images[i].astype(np.float32) / 255.0
+
+            # Metrics (on covered pixels only for PSNR)
+            n_covered = int(coverage.sum())
+            coverage_pct = n_covered / (H * W) * 100.0
+
+            if n_covered > 100:
+                diff_sq = ((gt_float - rendered) ** 2)[coverage]
+                mse = float(diff_sq.mean())
+                psnr = float(-10.0 * np.log10(mse + 1e-10))
+                ssim = self._compute_ssim(gt_float, rendered)
+            else:
+                psnr, ssim = 0.0, 0.0
+
+            # Error map (colored)
+            error = np.mean(np.abs(gt_float - rendered), axis=2)
+            error[~coverage] = 0.0
+            error_norm = np.clip(error / 0.25, 0, 1)
+            error_colored = (cm.jet(error_norm)[:, :, :3] * 255).astype(np.uint8)
+            error_colored[~coverage] = [40, 40, 40]
+
+            # Build comparison: [GT | Rendered | Error Map]
+            gt_u8 = self.original_images[i]
+            ren_u8 = (np.clip(rendered, 0, 1) * 255).astype(np.uint8)
+
+            gt_lbl = gt_u8.copy()
+            ren_lbl = ren_u8.copy()
+            err_lbl = error_colored.copy()
+            cv2.putText(gt_lbl, "GT", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(ren_lbl, f"Rendered  PSNR:{psnr:.1f}", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(err_lbl, f"Error  Cov:{coverage_pct:.0f}%", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+            sep = np.full((H, 2, 3), 255, dtype=np.uint8)
+            combined = np.concatenate([gt_lbl, sep, ren_lbl, sep, err_lbl], axis=1)
+
+            self._rendered_frames.append({
+                'combined': combined,
+                'psnr': psnr,
+                'ssim': ssim,
+                'coverage': coverage_pct,
+            })
+
+            if (i + 1) % 20 == 0 or i == S - 1:
+                self.render_status_text.value = f"Rendered {i + 1}/{S}..."
+                self._update_render_display(
+                    self.gui_timestep.value if hasattr(self, 'gui_timestep') else 0
+                )
+
+        valid_r = [r for r in self._rendered_frames if r['psnr'] > 0]
+        if valid_r:
+            avg_psnr = np.mean([r['psnr'] for r in valid_r])
+            avg_ssim = np.mean([r['ssim'] for r in valid_r])
+            avg_cov = np.mean([r['coverage'] for r in valid_r])
+            self.render_status_text.value = (
+                f"Done! Avg PSNR: {avg_psnr:.2f} | SSIM: {avg_ssim:.4f} | Cov: {avg_cov:.0f}%"
+            )
+        else:
+            self.render_status_text.value = "Done (no valid renderings)"
+        self.compute_render_btn.disabled = False
+        self._update_render_display(
+            self.gui_timestep.value if hasattr(self, 'gui_timestep') else 0
+        )
+
+    @staticmethod
+    def _render_zbuffer(pts, cols, R_w2c, t_w2c, K, H, W, splat_radius=0,
+                        point_indices=None):
+        """Z-buffer render using OpenGL hardware rasterization (moderngl).
+
+        Falls back to PyTorch if moderngl is not available.
+        """
+        if point_indices is None:
+            point_indices = np.arange(len(pts), dtype=np.int64)
+
+        point_size = max(1.0, float(2 * splat_radius + 1))
+
+        renderer = _get_gl_renderer()
+        return renderer.render(
+            pts, cols, point_indices,
+            R_w2c, t_w2c, K, H, W,
+            point_size=point_size,
+        )
+
+    @staticmethod
+    def _render_zbuffer_gpu(all_pts_np, all_cols_np, all_idx_np, active_idx,
+                            R_w2c, t_w2c, K, H, W, splat_radius=0):
+        """Z-buffer render using OpenGL. active_idx selects which points to render.
+
+        Args:
+            all_pts_np: (N, 3) float32 numpy
+            all_cols_np: (N, 3) float32 numpy
+            all_idx_np: (N,) int64 numpy — global point indices
+            active_idx: numpy int array or torch tensor — indices of active points
+            R_w2c, t_w2c: numpy arrays — camera extrinsics
+            K: (3,3) numpy — intrinsics
+
+        Returns: (rendered, coverage, index_buf)
+        """
+        if isinstance(active_idx, torch.Tensor):
+            active_idx = active_idx.cpu().numpy()
+        active_idx = active_idx.astype(np.int64)
+
+        if len(active_idx) == 0:
+            return (np.zeros((H, W, 3), dtype=np.float32),
+                    np.zeros((H, W), dtype=bool),
+                    np.full((H, W), -1, dtype=np.int64))
+
+        pts = all_pts_np[active_idx]
+        cols = all_cols_np[active_idx]
+        pidx = all_idx_np[active_idx]
+
+        point_size = max(1.0, float(2 * splat_radius + 1))
+        renderer = _get_gl_renderer()
+        return renderer.render(pts, cols, pidx, R_w2c, t_w2c, K, H, W,
+                               point_size=point_size)
+
+    @staticmethod
+    def _compute_ssim(img1, img2):
+        """Compute mean SSIM between two (H, W, 3) float images in [0, 1]."""
+        C1 = 0.01 ** 2
+        C2 = 0.03 ** 2
+        ssim_per_ch = []
+        for c in range(3):
+            a = img1[:, :, c].astype(np.float64)
+            b = img2[:, :, c].astype(np.float64)
+            mu_a = cv2.GaussianBlur(a, (11, 11), 1.5)
+            mu_b = cv2.GaussianBlur(b, (11, 11), 1.5)
+            s_aa = cv2.GaussianBlur(a * a, (11, 11), 1.5) - mu_a * mu_a
+            s_bb = cv2.GaussianBlur(b * b, (11, 11), 1.5) - mu_b * mu_b
+            s_ab = cv2.GaussianBlur(a * b, (11, 11), 1.5) - mu_a * mu_b
+            ssim_map = ((2 * mu_a * mu_b + C1) * (2 * s_ab + C2)) / \
+                       ((mu_a ** 2 + mu_b ** 2 + C1) * (s_aa + s_bb + C2))
+            ssim_per_ch.append(float(np.mean(ssim_map)))
+        return float(np.mean(ssim_per_ch))
+
+    def _compute_error_filter(self, error_threshold=0.1, min_bad_views=2):
+        """Incremental map building with error-based pruning.
+
+        Simulates streaming: for each frame i, accumulates points 0..i into
+        the map, renders from viewpoint i, identifies high-error points via
+        index buffer, and prunes them. The map grows incrementally with
+        continuous quality control.
+
+        Also renders the unpruned accumulated map for side-by-side comparison.
+        """
+        if not hasattr(self, '_pts_per_frame'):
+            self.filter_status_text.value = "No point data. Run 'Compute Renderings' first."
+            self.compute_filter_btn.disabled = False
+            return
+
+        H, W = self.original_images[0].shape[:2]
+        S = len(self.all_steps)
+        stride = self._render_stride
+        splat_radius = stride // 2 if stride > 1 else 0
+
+        # Flatten all points with global indices and frame boundaries
+        all_pts = np.concatenate(
+            [p for p in self._pts_per_frame if len(p) > 0] or [np.zeros((0, 3), dtype=np.float32)],
+            axis=0,
+        )
+        all_cols = np.concatenate(
+            [c for c in self._cols_per_frame if len(c) > 0] or [np.zeros((0, 3), dtype=np.float32)],
+            axis=0,
+        )
+        N = len(all_pts)
+
+        # Frame boundary offsets: frame i owns points [offsets[i], offsets[i+1])
+        offsets = [0]
+        for p in self._pts_per_frame:
+            offsets.append(offsets[-1] + len(p))
+
+        # Per-point state
+        good_mask = np.ones(N, dtype=bool)          # still in the map?
+        bad_count = np.zeros(N, dtype=np.int32)      # how many views flagged this point
+        total_removed = 0
+
+        self.filter_status_text.value = f"Incremental filtering {S} frames ({N:,} pts)..."
+        self._filtered_frames = []
+        self._unfiltered_accum_frames = []
+
+        import time as _time
+        _t_total_start = _time.perf_counter()
+
+        all_idx = np.arange(N, dtype=np.int64)
+        point_size = max(1.0, float(2 * splat_radius + 1))
+
+        # Two GL contexts: one for filtered (with kill_points), one for unfiltered
+        gl_filt = _GLPointRenderer()
+        gl_unfilt = _GLPointRenderer()
+
+        # Upload ALL points once to both renderers
+        gl_filt.upload_points(all_pts, all_cols, all_idx)
+        gl_unfilt.upload_points(all_pts, all_cols, all_idx)
+
+        already_killed = set()  # track which points have been killed in gl_filt
+
+        for i, step in enumerate(self.all_steps):
+            _t_frame_start = _time.perf_counter()
+            R_c2w = np.asarray(self.cam_dict["R"][step], dtype=np.float64)
+            t_c2w = np.asarray(self.cam_dict["t"][step], dtype=np.float64)
+            R_w2c = R_c2w.T
+            t_w2c = -R_w2c @ t_c2w
+            focal = float(self.cam_dict["focal"][step])
+            ppx, ppy = self.cam_dict["pp"][step]
+            K = np.array([[focal, 0, float(ppx)],
+                          [0, focal, float(ppy)],
+                          [0, 0, 1]], dtype=np.float64)
+
+            gt_float = self.original_images[i].astype(np.float32) / 255.0
+            end = offsets[i + 1]
+
+            # ── Render accumulated map (frames 0..i) ──
+            rendered, coverage, index_buf = gl_filt.render_view(
+                R_w2c, t_w2c, K, H, W, point_size=point_size,
+                num_points=end)
+
+            # Error analysis: L1 → flag bad points from all frames
+            error = np.mean(np.abs(gt_float - rendered), axis=2)
+            high_error = (error > error_threshold) & coverage
+            bad_ids = index_buf[high_error].ravel()
+            bad_ids = np.unique(bad_ids[bad_ids >= 0])
+
+            if len(bad_ids) > 0:
+                np.add.at(bad_count, bad_ids, 1)
+                to_kill = bad_ids[
+                    (bad_count[bad_ids] >= min_bad_views) & good_mask[bad_ids]]
+                if len(to_kill) > 0:
+                    good_mask[to_kill] = False
+                    gl_filt.kill_points(to_kill.tolist())
+                total_removed = int((~good_mask[:end]).sum())
+
+            _t_frame_end = _time.perf_counter()
+            _dt_frame = _t_frame_end - _t_frame_start
+            _n_active = int(good_mask[:end].sum())
+
+            if (i + 1) % 50 == 0 or i == S - 1:
+                _elapsed = _t_frame_end - _t_total_start
+                _fps = (i + 1) / _elapsed
+                pct = total_removed / max(offsets[i + 1], 1) * 100
+                self.filter_status_text.value = (
+                    f"Pruning {i + 1}/{S} | {_n_active:,} pts | "
+                    f"{_dt_frame*1000:.0f}ms | {_fps:.1f} FPS | "
+                    f"Rm: {total_removed:,} ({pct:.1f}%)"
+                )
+                print(
+                    f"[ErrorFilter] Frame {i+1}/{S}: "
+                    f"{_n_active:,} active pts, "
+                    f"{_dt_frame*1000:.1f}ms, "
+                    f"avg {_fps:.2f} FPS, "
+                    f"removed {total_removed:,}"
+                )
+
+        # ── Phase 1 done: timing ──
+        _t_prune = _time.perf_counter() - _t_total_start
+        pct_removed = total_removed / max(N, 1) * 100
+        print(
+            f"[ErrorFilter] Pruning done: {S} frames, {N:,} pts, "
+            f"{_t_prune:.1f}s ({_t_prune/S*1000:.0f}ms/f), "
+            f"removed {total_removed:,} ({pct_removed:.1f}%)"
+        )
+
+        # ══════════════════════════════════════════════════════════════════
+        # Phase 2: Generate visualizations (render filtered + unfiltered)
+        # ══════════════════════════════════════════════════════════════════
+        self.filter_status_text.value = f"Generating visualizations..."
+        self._filtered_frames = []
+        self._unfiltered_accum_frames = []
+
+        sep = np.full((H, 2, 3), 255, dtype=np.uint8)
+
+        for i, step in enumerate(self.all_steps):
+            R_c2w = np.asarray(self.cam_dict["R"][step], dtype=np.float64)
+            t_c2w = np.asarray(self.cam_dict["t"][step], dtype=np.float64)
+            R_w2c = R_c2w.T
+            t_w2c = -R_w2c @ t_c2w
+            focal = float(self.cam_dict["focal"][step])
+            ppx, ppy = self.cam_dict["pp"][step]
+            K = np.array([[focal, 0, float(ppx)],
+                          [0, focal, float(ppy)],
+                          [0, 0, 1]], dtype=np.float64)
+
+            gt_float = self.original_images[i].astype(np.float32) / 255.0
+            end = offsets[i + 1]
+
+            # Filtered render (pruned points already killed)
+            ren_filt, cov_filt, _ = gl_filt.render_view(
+                R_w2c, t_w2c, K, H, W, point_size=point_size,
+                num_points=end)
+            # Unfiltered render
+            ren_unfilt, cov_unfilt, _ = gl_unfilt.render_view(
+                R_w2c, t_w2c, K, H, W, point_size=point_size,
+                num_points=end)
+
+            # PSNR
+            n_cov_f = int(cov_filt.sum())
+            n_cov_u = int(cov_unfilt.sum())
+            filt_psnr = unfilt_psnr = 0.0
+            if n_cov_f > 100:
+                mse_f = float(((gt_float - ren_filt) ** 2)[cov_filt].mean())
+                filt_psnr = float(-10.0 * np.log10(mse_f + 1e-10))
+            if n_cov_u > 100:
+                mse_u = float(((gt_float - ren_unfilt) ** 2)[cov_unfilt].mean())
+                unfilt_psnr = float(-10.0 * np.log10(mse_u + 1e-10))
+            psnr_delta = filt_psnr - unfilt_psnr
+
+            # [GT | Filtered | Error]
+            err_filt = np.mean(np.abs(gt_float - ren_filt), axis=2)
+            err_filt[~cov_filt] = 0.0
+            err_u8 = np.clip(err_filt * (255.0 / 0.25), 0, 255).astype(np.uint8)
+            err_colored = np.zeros((H, W, 3), dtype=np.uint8)
+            err_colored[:, :, 2] = err_u8
+            err_colored[:, :, 1] = 255 - err_u8
+            err_colored[~cov_filt] = [40, 40, 40]
+
+            gt_u8 = self.original_images[i].copy()
+            filt_u8 = (np.clip(ren_filt, 0, 1) * 255).astype(np.uint8)
+            n_in_map = int(good_mask[:end].sum())
+            cv2.putText(gt_u8, "GT", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(filt_u8, f"Filtered PSNR:{filt_psnr:.1f} ({psnr_delta:+.1f})", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(err_colored, f"Map:{n_in_map:,}pts Rm:{total_removed:,}", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+            combined = np.concatenate([gt_u8, sep, filt_u8, sep, err_colored], axis=1)
+            self._filtered_frames.append({
+                'combined': combined, 'psnr': filt_psnr, 'ssim': 0.0,
+                'coverage': n_cov_f / (H * W) * 100.0, 'psnr_delta': psnr_delta,
+            })
+
+            # [Unfiltered | Filtered | Improvement]
+            unfilt_u8 = (np.clip(ren_unfilt, 0, 1) * 255).astype(np.uint8)
+            err_unfilt = np.mean(np.abs(gt_float - ren_unfilt), axis=2)
+            improvement = err_unfilt - err_filt
+            imp_vis = np.zeros((H, W, 3), dtype=np.uint8)
+            better = improvement > 0.01
+            worse = improvement < -0.01
+            if better.any():
+                imp_vis[better, 1] = (np.clip(improvement[better] / 0.15, 0, 1) * 255).astype(np.uint8)
+            if worse.any():
+                imp_vis[worse, 0] = (np.clip(-improvement[worse] / 0.15, 0, 1) * 255).astype(np.uint8)
+
+            cv2.putText(unfilt_u8, f"No filter PSNR:{unfilt_psnr:.1f}", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            filt_u8_2 = (np.clip(ren_filt, 0, 1) * 255).astype(np.uint8)
+            cv2.putText(filt_u8_2, f"Filtered PSNR:{filt_psnr:.1f}", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(imp_vis, f"dPSNR:{psnr_delta:+.1f}", (5, 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+            filter_cmp = np.concatenate([unfilt_u8, sep, filt_u8_2, sep, imp_vis], axis=1)
+            self._unfiltered_accum_frames.append({
+                'filter_cmp': filter_cmp,
+                'psnr_unfilt': unfilt_psnr, 'psnr_filt': filt_psnr,
+            })
+
+        # ── Final summary ──
+        _t_total = _time.perf_counter() - _t_total_start
+        print(
+            f"[ErrorFilter] TOTAL: {_t_total:.1f}s "
+            f"(prune {_t_prune:.1f}s + vis {_t_total - _t_prune:.1f}s)"
+        )
+
+        valid_f = [r for r in self._filtered_frames if r['psnr'] > 0]
+        valid_u = [r for r in self._unfiltered_accum_frames if r['psnr_unfilt'] > 0]
+        if valid_f and valid_u:
+            avg_filt = np.mean([r['psnr'] for r in valid_f])
+            avg_unfilt = np.mean([r['psnr_unfilt'] for r in valid_u])
+            self.filter_status_text.value = (
+                f"Done! {_t_total:.1f}s (prune {_t_prune:.1f}s) | "
+                f"Rm {pct_removed:.1f}% | "
+                f"PSNR: {avg_unfilt:.2f}→{avg_filt:.2f} ({avg_filt - avg_unfilt:+.2f})"
+            )
+        else:
+            self.filter_status_text.value = f"Done. {_t_total:.1f}s. Removed {pct_removed:.1f}%."
+
+        # Release dedicated GL contexts
+        gl_filt.release()
+        gl_unfilt.release()
+
+        self.show_filtered_checkbox.value = True
+        self.compute_filter_btn.disabled = False
+        self._update_render_display(
+            self.gui_timestep.value if hasattr(self, 'gui_timestep') else 0
+        )
+
+    def _update_render_display(self, frame_idx):
+        """Update the rendering comparison panel for the given frame."""
+        # Choose between original and filtered
+        show_filtered = (hasattr(self, 'show_filtered_checkbox')
+                         and self.show_filtered_checkbox.value
+                         and hasattr(self, '_filtered_frames')
+                         and self._filtered_frames)
+
+        if show_filtered:
+            frames = self._filtered_frames
+        elif hasattr(self, '_rendered_frames') and self._rendered_frames:
+            frames = self._rendered_frames
+        else:
+            return
+
+        idx = min(frame_idx, len(frames) - 1)
+        data = frames[idx]
+        self.render_comparison_image.image = data['combined']
+
+        delta_str = ""
+        if show_filtered and 'psnr_delta' in data:
+            delta_str = f" ({data['psnr_delta']:+.2f})"
+
+        self.render_metrics_text.value = (
+            f"Frame {idx}: PSNR {data['psnr']:.2f} dB{delta_str} | "
+            f"SSIM {data['ssim']:.4f} | Cov {data['coverage']:.1f}%"
+        )
+
+        # Update filter comparison panel (Unfiltered | Filtered | Improvement)
+        if (hasattr(self, '_unfiltered_accum_frames') and self._unfiltered_accum_frames
+                and idx < len(self._unfiltered_accum_frames)):
+            self.filter_comparison_image.image = self._unfiltered_accum_frames[idx]['filter_cmp']
 
     def _move_to_camera(self, frame_idx: int, smooth: bool = True):
         """Move viewer camera to match reconstructed camera at given frame."""
@@ -1209,6 +2050,8 @@ class PointCloudViewer:
                 self.frame_nodes[current_timestep].visible = True
                 self.frame_nodes[prev_timestep].visible = False
             self.server.flush()
+
+            self._update_render_display(current_timestep)
 
             prev_timestep = current_timestep
 

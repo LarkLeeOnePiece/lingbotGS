@@ -90,8 +90,13 @@ def load_images(image_folder=None, video_path=None, fps=10, image_ext=".jpg,.png
     else:
         exts = image_ext.split(",")
         paths = []
+        seen = set()
         for ext in exts:
-            paths.extend(glob.glob(os.path.join(image_folder, f"*{ext}")))
+            for p in glob.glob(os.path.join(image_folder, f"*{ext}")):
+                norm = os.path.normcase(os.path.abspath(p))
+                if norm not in seen:
+                    seen.add(norm)
+                    paths.append(p)
         paths = sorted(paths)
         resolved_folder = image_folder
 
