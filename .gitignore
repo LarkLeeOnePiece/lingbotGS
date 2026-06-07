@@ -10,6 +10,10 @@ build/
 
 # Output directories (training/eval results - too large for git)
 output_*/
+output/
+
+# Dataset (download separately)
+data/
 
 # Large files
 *.onnx
